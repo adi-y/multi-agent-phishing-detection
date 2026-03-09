@@ -1,0 +1,25 @@
+# Virtual environment
+venv/
+
+# Large dataset files
+datasets/malicious_phish.csv
+datasets/url_features.csv
+
+# Model files (too large for GitHub)
+model/url_model_ensemble.pkl
+model/feature_columns.pkl
+backend/url_model.pkl
+
+# WHOIS cache
+url_agent/whois_cache.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# VS Code
+.vscode/
