@@ -6,6 +6,8 @@ import math
 from agents.url_agent.ngram_features import extract_ngram_features
 from agents.url_agent.url_resolver import resolve_url, is_shortened
 from agents.url_agent.scheme_features import get_scheme_features
+from agents.url_agent.whois_features import extract_whois_features
+from agents.url_agent.url_normalizer import get_normalization_features
 
 # --- Suspicious signals ---
 SUSPICIOUS_WORDS = [
@@ -167,9 +169,12 @@ def extract_features(url):
 
     # --- Boolean features ---
     f["has_ip"] = has_ip(url)
-    # Gap 3 — Replace misleading uses_https with 4 smarter scheme features
-    scheme_feats = get_scheme_features(url)
-    f.update(scheme_feats)
+    # Gap 3 + Normalization Fix — replaces raw scheme with bias-corrected features
+    norm_feats = get_normalization_features(url)
+    f.update(norm_feats)
+    # Keep scheme_mismatch (brand name appearing on plain HTTP = strong phishing signal)
+    scheme = get_scheme_features(url)
+    f["scheme_mismatch"] = scheme["scheme_mismatch"]
     f["has_at_symbol"] = 1 if "@" in url else 0
     f["has_double_slash"] = has_double_slash_redirect(url)
     try:
