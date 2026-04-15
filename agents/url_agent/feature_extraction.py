@@ -1,15 +1,14 @@
-import pandas as pd
 import re
-import numpy as np
-from urllib.parse import urlparse, parse_qs
 import math
+from urllib.parse import urlparse, parse_qs
+
 from agents.url_agent.ngram_features import extract_ngram_features
 from agents.url_agent.url_resolver import resolve_url, is_shortened
-from agents.url_agent.scheme_features import get_scheme_features
 from agents.url_agent.whois_features import extract_whois_features
-from agents.url_agent.url_normalizer import get_normalization_features
+from agents.url_agent.url_normalizer import normalize_url, get_normalization_features
+from agents.url_agent.scheme_features import get_scheme_features
 
-# --- Suspicious signals ---
+# ── Suspicious signals ────────────────────────────────────────────────────────
 SUSPICIOUS_WORDS = [
     "login", "secure", "verify", "update", "bank", "account", "signin",
     "webscr", "ebayisapi", "confirm", "password", "credential", "submit",
@@ -23,18 +22,27 @@ TRUSTED_BRANDS = [
     "wellsfargo", "bankofamerica", "citibank", "steam", "runescape"
 ]
 
-SUSPICIOUS_TLDS = [
+SUSPICIOUS_TLDS = {
     ".tk", ".ml", ".ga", ".cf", ".gq", ".xyz", ".top", ".club",
     ".info", ".biz", ".online", ".site", ".website", ".store",
     ".live", ".stream", ".download", ".click", ".link"
-]
+}
 
-FREE_HOSTING = [
+FREE_HOSTING = {
     "000webhostapp", "weebly", "wix", "wordpress.com", "blogspot",
     "tripod", "angelfire", "godaddysites", "joomla", "000webhost",
     "htmldrop", "x10host", "biz.nf", "altervista"
-]
+}
 
+MISLEADING_PREFIXES = (
+    "secure-", "login-", "verify-", "update-",
+    "account-", "confirm-", "banking-", "safe-"
+)
+
+SUSPICIOUS_WORDS_SET = set(SUSPICIOUS_WORDS)
+
+
+# ── Helper functions ──────────────────────────────────────────────────────────
 
 def has_ip(url):
     return 1 if re.search(r'(\d{1,3}\.){3}\d{1,3}', url) else 0
@@ -42,166 +50,245 @@ def has_ip(url):
 
 def get_entropy(s):
     if not s:
-        return 0
-    prob = [float(s.count(c)) / len(s) for c in set(s)]
-    return -sum(p * math.log2(p) for p in prob if p > 0)
+        return 0.0
+    length = len(s)
+    return -sum(
+        (cnt / length) * math.log2(cnt / length)
+        for cnt in (s.count(c) for c in set(s))
+        if cnt > 0
+    )
 
 
 def count_suspicious_words(url):
     url_lower = url.lower()
-    return sum(word in url_lower for word in SUSPICIOUS_WORDS)
+    return sum(1 for w in SUSPICIOUS_WORDS_SET if w in url_lower)
 
 
-def has_brand_in_subdomain(url):
-    """Brand name in subdomain but not as the real domain (e.g., paypal.evil.com)"""
-    try:
-        parsed = urlparse(url if "://" in url else "http://" + url)
-        hostname = parsed.hostname or ""
-        parts = hostname.split(".")
-        # Check if a brand appears before the last 2 parts (actual domain)
-        subdomain_parts = parts[:-2] if len(parts) > 2 else []
-        subdomain = ".".join(subdomain_parts).lower()
-        return int(any(brand in subdomain for brand in TRUSTED_BRANDS))
-    except:
+def has_brand_in_subdomain(hostname):
+    """Pass already-parsed hostname for speed."""
+    parts = hostname.split(".")
+    if len(parts) <= 2:
         return 0
+    subdomain = ".".join(parts[:-2]).lower()
+    return int(any(brand in subdomain for brand in TRUSTED_BRANDS))
 
 
-def uses_free_hosting(url):
-    url_lower = url.lower()
+def uses_free_hosting(url_lower):
     return int(any(host in url_lower for host in FREE_HOSTING))
 
 
-def count_digits_in_domain(url):
-    try:
-        parsed = urlparse(url if "://" in url else "http://" + url)
-        hostname = parsed.hostname or ""
-        return sum(c.isdigit() for c in hostname)
-    except:
-        return 0
+def count_digits_in_domain(hostname):
+    return sum(c.isdigit() for c in hostname)
 
 
-def has_suspicious_tld(url):
-    try:
-        parsed = urlparse(url if "://" in url else "http://" + url)
-        hostname = parsed.hostname or ""
-        return int(any(hostname.endswith(tld) for tld in SUSPICIOUS_TLDS))
-    except:
-        return 0
+def has_suspicious_tld(hostname):
+    return int(any(hostname.endswith(tld) for tld in SUSPICIOUS_TLDS))
 
 
-def count_query_params(url):
-    try:
-        parsed = urlparse(url if "://" in url else "http://" + url)
-        return len(parse_qs(parsed.query))
-    except:
-        return 0
+def count_query_params(query):
+    return len(parse_qs(query)) if query else 0
 
 
-def path_depth(url):
-    try:
-        parsed = urlparse(url if "://" in url else "http://" + url)
-        return parsed.path.count("/")
-    except:
-        return 0
+def calc_path_depth(path):
+    return path.count("/")
 
 
 def has_double_slash_redirect(url):
-    return 1 if "//" in url[7:] else 0  # skip the protocol slashes
+    check = url[7:] if len(url) > 7 else url
+    return 1 if "//" in check else 0
 
 
-def domain_length(url):
+def calc_domain_length(hostname):
+    parts = hostname.split(".")
+    root = ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+    return len(root)
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def extract_features(url: str,
+                     live_whois: bool = False,
+                     skip_resolve: bool = False) -> dict:
+    """
+    Extract all features from a URL.
+
+    Args:
+        url:          Raw URL string (with or without scheme)
+        live_whois:   If True, performs live WHOIS lookup.
+                      Default False — fast for training and testing.
+        skip_resolve: If True, skips URL shortener resolution entirely.
+                      Always set True during training for speed.
+                      Default False — resolution runs in real-time API.
+    """
     try:
-        parsed = urlparse(url if "://" in url else "http://" + url)
-        hostname = parsed.hostname or ""
-        # Just root domain (last 2 parts)
-        parts = hostname.split(".")
-        root = ".".join(parts[-2:]) if len(parts) >= 2 else hostname
-        return len(root)
-    except:
-        return 0
+        return _extract(url, live_whois, skip_resolve)
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] extract_features failed for '{url}': {e}")
+        traceback.print_exc()
+        return None
 
 
-def extract_features(url):
+def _extract(url: str, live_whois: bool, skip_resolve: bool) -> dict:
     url = str(url).strip()
 
-    # Gap 1 — Resolve shortened URLs before extracting features
-    was_shortened = is_shortened(url)
-    if was_shortened:
+    # ── Gap 1: resolve shortened URLs (skip during training) ──────────────
+    was_shortened = False
+    if not skip_resolve and is_shortened(url):
+        was_shortened = True
         url = resolve_url(url)
 
-    url_with_scheme = url if "://" in url else "http://" + url
+    # ── Capture scheme/www from original BEFORE stripping ─────────────────
+    norm_meta    = normalize_url(url)
+    norm_feats   = get_normalization_features(url)
+    scheme_feats = get_scheme_features(url)
+
+    # ── All structural features use the bare URL ───────────────────────────
+    # e.g. "https://www.google.com/path?q=1" → "google.com/path?q=1"
+    bare = norm_meta["normalized"]
+    bare_for_parse = "http://" + bare if "://" not in bare else bare
 
     try:
-        parsed = urlparse(url_with_scheme)
+        parsed   = urlparse(bare_for_parse)
         hostname = parsed.hostname or ""
-        path = parsed.path or ""
-        query = parsed.query or ""
-    except:
-        from urllib.parse import ParseResult
-        parsed = ParseResult(scheme="", netloc="", path="", params="", query="", fragment="")
-        hostname, path, query = "", "", ""
+        path     = parsed.path or ""
+        query    = parsed.query or ""
+        fragment = parsed.fragment or ""
+        port     = parsed.port
+    except Exception:
+        hostname = ""
+        path     = ""
+        query    = ""
+        fragment = ""
+        port     = None
 
-    parts = hostname.split(".")
+    bare_lower = bare.lower()
+    parts      = hostname.split(".") if hostname else []
 
-    f = {}
+    # ── Structural (18) ───────────────────────────────────────────────────
+    url_length           = len(bare)
+    domain_len           = calc_domain_length(hostname)
+    path_len             = len(path)
+    query_len            = len(query)
+    num_dots             = bare.count(".")
+    num_hyphens          = bare.count("-")
+    num_underscores      = bare.count("_")
+    num_slashes          = bare.count("/")
+    num_question_marks   = bare.count("?")
+    num_ampersands       = bare.count("&")
+    num_equals           = bare.count("=")
+    num_at_symbols       = bare.count("@")
+    num_percent          = bare.count("%")
+    num_digits_in_url    = sum(c.isdigit() for c in bare)
+    num_digits_in_domain = count_digits_in_domain(hostname)
+    num_subdomains       = max(0, len(parts) - 2)
+    depth                = calc_path_depth(path)
+    num_query_params     = count_query_params(query)
 
-    # --- Length features ---
-    f["url_length"] = len(url)
-    f["domain_length"] = domain_length(url)
-    f["path_length"] = len(path)
-    f["query_length"] = len(query)
+    # ── Boolean signals (13) ──────────────────────────────────────────────
+    ip_flag              = has_ip(bare)
+    at_flag              = 1 if "@" in bare else 0
+    double_slash_flag    = has_double_slash_redirect(bare)
+    port_flag            = 1 if port is not None else 0
+    fragment_flag        = 1 if fragment else 0
+    suspicious_tld_flag  = has_suspicious_tld(hostname)
+    free_hosting_flag    = uses_free_hosting(bare_lower)
+    brand_subdomain_flag = has_brand_in_subdomain(hostname)
+    shortened_flag       = int(was_shortened)
+    exact_brand_flag     = norm_feats["is_exact_brand"]
+    scheme_mismatch      = scheme_feats["scheme_mismatch"]
+    had_www_flag         = norm_feats["had_www"]
+    misleading_prefix = int(hostname and any(hostname.startswith(p) for p in MISLEADING_PREFIXES))
 
-    # --- Count features ---
-    f["num_dots"] = url.count(".")
-    f["num_hyphens"] = url.count("-")
-    f["num_underscores"] = url.count("_")
-    f["num_slashes"] = url.count("/")
-    f["num_question_marks"] = url.count("?")
-    f["num_ampersands"] = url.count("&")
-    f["num_equals"] = url.count("=")
-    f["num_at_symbols"] = url.count("@")
-    f["num_percent"] = url.count("%")
-    f["num_digits_in_url"] = sum(c.isdigit() for c in url)
-    f["num_digits_in_domain"] = count_digits_in_domain(url)
-    f["num_subdomains"] = hostname.count(".") if hostname else 0
-    f["path_depth"] = path_depth(url)
-    f["num_query_params"] = count_query_params(url)
+    # ── Scheme (3) — from original url ────────────────────────────────────
+    had_https     = norm_feats["had_https"]
+    had_http      = norm_feats["had_http"]
+    had_no_scheme = norm_feats["had_no_scheme"]
 
-    # --- Boolean features ---
-    f["has_ip"] = has_ip(url)
-    # Gap 3 + Normalization Fix — replaces raw scheme with bias-corrected features
-    norm_feats = get_normalization_features(url)
-    f.update(norm_feats)
-    # Keep scheme_mismatch (brand name appearing on plain HTTP = strong phishing signal)
-    scheme = get_scheme_features(url)
-    f["scheme_mismatch"] = scheme["scheme_mismatch"]
-    f["has_at_symbol"] = 1 if "@" in url else 0
-    f["has_double_slash"] = has_double_slash_redirect(url)
-    try:
-        f["has_port"] = 1 if parsed.port else 0
-    except:
-        f["has_port"] = 0
-    f["has_fragment"] = 1 if parsed.fragment else 0
-    f["has_suspicious_tld"] = has_suspicious_tld(url)
-    f["uses_free_hosting"] = uses_free_hosting(url)
-    f["has_brand_in_subdomain"] = has_brand_in_subdomain(url)
+    # ── Entropy (3) ───────────────────────────────────────────────────────
+    url_entropy    = get_entropy(bare)
+    domain_entropy = get_entropy(hostname)
+    path_entropy   = get_entropy(path)
 
-    # --- NLP/string features ---
-    f["suspicious_word_count"] = count_suspicious_words(url)
-    f["url_entropy"] = get_entropy(url)
-    f["domain_entropy"] = get_entropy(hostname)
-    f["path_entropy"] = get_entropy(path)
+    # ── Ratio (2) ─────────────────────────────────────────────────────────
+    digit_ratio        = num_digits_in_url / max(url_length, 1)
+    special_chars      = sum(1 for c in bare if not c.isalnum() and c not in "-._~/")
+    special_char_ratio = special_chars / max(url_length, 1)
 
-    # --- Ratio features ---
-    url_len = len(url) if len(url) > 0 else 1
-    f["digit_ratio"] = f["num_digits_in_url"] / url_len
-    f["special_char_ratio"] = (f["num_hyphens"] + f["num_underscores"] + f["num_percent"]) / url_len
+    # ── N-gram / obfuscation (8) — Gap 2 ──────────────────────────────────
+    ngram_feats = extract_ngram_features(bare)
 
-    # --- Shortener detection (Gap 1) ---
-    f["is_shortened"] = int(was_shortened)
+    # ── WHOIS (7) — Gap 5 ─────────────────────────────────────────────────
+    whois_feats = {
+    "domain_age_days": -1,
+    "days_until_expiry": -1,
+    "registration_period": -1,
+    "is_new_domain": 0,
+    "is_very_new_domain": 0,
+    "is_short_registration": 0,
+    "whois_lookup_failed": 1,
+    }
 
-    # --- Gap 2: N-gram & obfuscation features ---
-    ngram_feats = extract_ngram_features(url)
-    f.update(ngram_feats)
-
-    return f
+    return {
+        # Structural (18)
+        "url_length":              url_length,
+        "domain_length":           domain_len,
+        "path_length":             path_len,
+        "query_length":            query_len,
+        "num_dots":                num_dots,
+        "num_hyphens":             num_hyphens,
+        "num_underscores":         num_underscores,
+        "num_slashes":             num_slashes,
+        "num_question_marks":      num_question_marks,
+        "num_ampersands":          num_ampersands,
+        "num_equals":              num_equals,
+        "num_at_symbols":          num_at_symbols,
+        "num_percent":             num_percent,
+        "num_digits_in_url":       num_digits_in_url,
+        "num_digits_in_domain":    num_digits_in_domain,
+        "num_subdomains":          num_subdomains,
+        "path_depth":              depth,
+        "num_query_params":        num_query_params,
+        # Boolean signals (13)
+        "has_ip":                  ip_flag,
+        "has_at_symbol":           at_flag,
+        "has_double_slash":        double_slash_flag,
+        "has_port":                port_flag,
+        "has_fragment":            fragment_flag,
+        "has_suspicious_tld":      suspicious_tld_flag,
+        "uses_free_hosting":       free_hosting_flag,
+        "has_brand_in_subdomain":  brand_subdomain_flag,
+        "is_shortened":            shortened_flag,
+        "is_exact_brand":          exact_brand_flag,
+        "scheme_mismatch":         scheme_mismatch,
+        "had_www":                 had_www_flag,
+        "has_misleading_prefix":   misleading_prefix,
+        # Scheme (3)
+        "had_https":               had_https,
+        "had_http":                had_http,
+        "had_no_scheme":           had_no_scheme,
+        # Entropy (3)
+        "url_entropy":             url_entropy,
+        "domain_entropy":          domain_entropy,
+        "path_entropy":            path_entropy,
+        # Ratio (2)
+        "digit_ratio":             digit_ratio,
+        "special_char_ratio":      special_char_ratio,
+        # N-gram / obfuscation (8)
+        "brand_ngram_similarity":  ngram_feats["brand_ngram_similarity"],
+        "brand_trigram_similarity": ngram_feats["brand_trigram_similarity"],
+        "min_brand_edit_distance":  ngram_feats["min_brand_edit_distance"],
+        "is_typosquat":             ngram_feats["is_typosquat"],
+        "has_homograph_chars":      ngram_feats["has_homograph_chars"],
+        "brand_confusion_score":    ngram_feats["brand_confusion_score"],
+        "repeated_char_count":      ngram_feats["repeated_char_count"],
+        "suspicious_word_count":    count_suspicious_words(bare),
+        # WHOIS (7)
+        "domain_age_days":          whois_feats["domain_age_days"],
+        "days_until_expiry":        whois_feats["days_until_expiry"],
+        "registration_period":      whois_feats["registration_period"],
+        "is_new_domain":            whois_feats["is_new_domain"],
+        "is_very_new_domain":       whois_feats["is_very_new_domain"],
+        "is_short_registration":    whois_feats["is_short_registration"],
+        "whois_lookup_failed":      whois_feats["whois_lookup_failed"],
+    }
