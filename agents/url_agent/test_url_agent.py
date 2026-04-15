@@ -13,7 +13,9 @@ models = joblib.load(os.path.join(BASE_DIR, "model", "url_model_ensemble.pkl"))
 feature_cols = joblib.load(os.path.join(BASE_DIR, "model", "feature_columns.pkl"))
 
 def predict_url(url: str) -> dict:
-    features = pd.Series(extract_features(url)).to_frame().T
+    features = pd.Series(
+    extract_features(url, live_whois=False, skip_resolve=True)
+    ).to_frame().T
     features = features.reindex(columns=feature_cols, fill_value=0)
 
     rf_prob = models["rf"].predict_proba(features)[:, 1][0]
@@ -21,9 +23,12 @@ def predict_url(url: str) -> dict:
     gb_prob = models["gb"].predict_proba(features)[:, 1][0]
     avg_prob = (rf_prob + et_prob + gb_prob) / 3
 
+    if "is_exact_brand" in features.columns and features["is_exact_brand"].iloc[0] == 1:
+        avg_prob *= 0.2
+
     return {
         "url": url,
-        "verdict": "🚨 PHISHING" if avg_prob >= 0.5 else "✅ BENIGN",
+        "verdict": "🚨 PHISHING" if avg_prob >= 0.75 else "✅ BENIGN",
         "confidence": f"{avg_prob * 100:.2f}%",
         "score": round(avg_prob, 4)
     }
@@ -36,6 +41,7 @@ test_urls = [
     "https://facebook.com/login",
     "https://www.amazon.com",
     "https://github.com",
+    "https://teams.live.com/v2/",
 
     # Phishing sites
     "http://paypa1.com/secure-login",
